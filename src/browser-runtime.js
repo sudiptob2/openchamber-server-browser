@@ -7,7 +7,7 @@ import { MENU_BINDING, MENU_WORLD, createContextMenu } from './context-menu.js';
 import { createInspector } from './inspector.js';
 import { networkGrants, originGrants } from './config.js';
 import { createNativeSelectCompatibility } from './native-select-compatibility.js';
-import { createPolicyProxy } from './policy-proxy.js';
+import { createPolicyProxy, createReservedOverrides } from './policy-proxy.js';
 import { createSurface } from './surface.js';
 import { applyViewport, presetViewport } from './viewports.js';
 
@@ -40,12 +40,14 @@ export const createBrowserRuntime = ({
   chromePath = null,
   allowedOrigins = [],
   allowedNetworks = [],
+  allowReservedNetworks = [],
   configPath = null,
   devServers = null,
 } = {}) => {
   const chrome = createChromeProcess({ chromePath });
   const proxy = createPolicyProxy({
     grants: [...originGrants(allowedOrigins), ...networkGrants(allowedNetworks)],
+    reservedOverrides: createReservedOverrides(allowReservedNetworks),
     configPath,
     devServerGrants: devServers ? () => devServers.grants() : null,
   });

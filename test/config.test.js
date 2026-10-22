@@ -5,7 +5,13 @@ import { networkGrants, originGrants, parseConfig } from '../src/config.js';
 test('defaults to no private origin grants', () => {
   const config = parseConfig({});
 
-  assert.deepEqual(config, { chromePath: null, allowedOrigins: [], allowedNetworks: [], discoverDevServers: false });
+  assert.deepEqual(config, {
+    chromePath: null,
+    allowedOrigins: [],
+    allowedNetworks: [],
+    allowReservedNetworks: [],
+    discoverDevServers: false,
+  });
   assert.deepEqual(originGrants(config.allowedOrigins), []);
 });
 
@@ -54,6 +60,39 @@ test('rejects network blocks that are public, too broad, or missing explicit por
   }
 });
 
+
+test('takes a listed reserved range out of the permanent deny tier', () => {
+  const config = parseConfig({ allowReservedNetworks: ['100.64.0.0/10', 'fd7a:115c:a1e0::/48'] });
+
+  assert.deepEqual(config.allowReservedNetworks.map((entry) => entry.cidr), ['100.64.0.0/10', 'fd7a:115c:a1e0::/48']);
+  assert.deepEqual(config.allowReservedNetworks.map((entry) => entry.family), ['ipv4', 'ipv6']);
+});
+
+test('lets a reserved override carry an allowedNetworks block for its range', () => {
+  const config = parseConfig({
+    allowReservedNetworks: ['100.64.0.0/10'],
+    allowedNetworks: [{ cidr: '100.70.0.0/16', ports: [443] }],
+  });
+  const [grant] = networkGrants(config.allowedNetworks);
+
+  assert.equal(grant.block.check('100.70.46.55', 'ipv4'), true);
+  // Without the override the same block is still refused as a public range.
+  assert.throws(
+    () => parseConfig({ allowedNetworks: [{ cidr: '100.70.0.0/16', ports: [443] }] }),
+    /config\.allowedNetworks\[0\]/,
+  );
+});
+
+test('rejects reserved overrides that are malformed, too broad, or not reserved', () => {
+  for (const network of ['100.64.0.0', '100.64.0.0/4', '8.8.8.0/24', 'not-a-cidr/10', 42]) {
+    assert.throws(() => parseConfig({ allowReservedNetworks: [network] }), /config\.allowReservedNetworks\[0\]/);
+  }
+  // Ranges that protect against SSRF and loopback bypass cannot be listed at all.
+  for (const network of ['169.254.0.0/16', '0.0.0.0/8', '224.0.0.0/4', 'fe80::/16', 'ff00::/16']) {
+    assert.throws(() => parseConfig({ allowReservedNetworks: [network] }), /config\.allowReservedNetworks\[0\]/);
+  }
+  assert.throws(() => parseConfig({ allowReservedNetworks: '100.64.0.0/10' }), /must be an array/);
+});
 
 test('turns development-server discovery on only with an explicit boolean', () => {
   assert.equal(parseConfig({ discoverDevServers: true }).discoverDevServers, true);
