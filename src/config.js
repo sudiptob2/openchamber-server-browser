@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { isPrivateAddress } from './policy-proxy.js';
+import { canOverrideReserved, createReservedOverrides, isPrivateAddress } from './policy-proxy.js';
 
 const HTTP_PROTOCOLS = new Set(['http:', 'https:']);
 
@@ -34,15 +34,34 @@ const parsePorts = (value, label) => {
   }));
 };
 
-const parseAllowedNetwork = (value, index) => {
+// Reserved ranges an operator takes out of the permanent deny tier, so a grant
+// can reach them. Overlay networks such as Tailscale put peers in CGNAT space.
+const parseReservedNetwork = (value, index) => {
+  const label = `config.allowReservedNetworks[${index}]`;
+  const cidr = typeof value === 'string' ? /^(.+)\/(\d+)$/.exec(value.trim()) : null;
+  const prefix = Number(cidr?.[2]);
+  const address = cidr?.[1] ?? '';
+  const family = net.isIPv6(address) ? 'ipv6' : net.isIPv4(address) ? 'ipv4' : null;
+  const narrowest = family === 'ipv6' ? 128 : 32;
+  const broadest = family === 'ipv6' ? 16 : 8;
+  if (!cidr || !family || prefix < broadest || prefix > narrowest) {
+    throw new Error(`${label} must be a CIDR block from /${broadest} to /${narrowest}, such as 100.64.0.0/10`);
+  }
+  if (!canOverrideReserved(address)) {
+    throw new Error(`${label} must name a reserved range that is blocked by default; ${address} is not one, so it needs no override`);
+  }
+  return Object.freeze({ cidr: `${address}/${prefix}`, address, prefix, family });
+};
+
+const parseAllowedNetwork = (value, index, reservedOverrides) => {
   const label = `config.allowedNetworks[${index}]`;
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error(`${label} must be an object with cidr and ports`);
   }
   const cidr = typeof value.cidr === 'string' ? /^([\d.]+)\/(\d+)$/.exec(value.cidr) : null;
   const prefix = Number(cidr?.[2]);
-  if (!cidr || !net.isIPv4(cidr[1]) || prefix < 8 || prefix > 32 || !isPrivateAddress(cidr[1])) {
-    throw new Error(`${label}.cidr must be a private or loopback IPv4 block from /8 to /32, such as 192.168.1.0/24`);
+  if (!cidr || !net.isIPv4(cidr[1]) || prefix < 8 || prefix > 32 || !isPrivateAddress(cidr[1], reservedOverrides)) {
+    throw new Error(`${label}.cidr must be a private, loopback, or allowReservedNetworks IPv4 block from /8 to /32, such as 192.168.1.0/24`);
   }
   return Object.freeze({ cidr: value.cidr, address: cidr[1], prefix, ports: parsePorts(value.ports, label) });
 };
@@ -63,14 +82,22 @@ export const parseConfig = (value) => {
   if (value.allowedNetworks !== undefined && !Array.isArray(value.allowedNetworks)) {
     throw new Error('config.allowedNetworks must be an array');
   }
+  if (value.allowReservedNetworks !== undefined && !Array.isArray(value.allowReservedNetworks)) {
+    throw new Error('config.allowReservedNetworks must be an array');
+  }
   if (value.discoverDevServers !== undefined && typeof value.discoverDevServers !== 'boolean') {
     throw new Error('config.discoverDevServers must be true or false');
   }
   const allowedOrigins = (value.allowedOrigins ?? []).map(parseAllowedOrigin);
+  const allowReservedNetworks = (value.allowReservedNetworks ?? []).map(parseReservedNetwork);
+  const reservedOverrides = createReservedOverrides(allowReservedNetworks);
   return Object.freeze({
     chromePath: chromePath?.trim() ?? null,
     allowedOrigins: Object.freeze([...new Set(allowedOrigins)]),
-    allowedNetworks: Object.freeze((value.allowedNetworks ?? []).map(parseAllowedNetwork)),
+    allowedNetworks: Object.freeze((value.allowedNetworks ?? []).map(
+      (network, index) => parseAllowedNetwork(network, index, reservedOverrides),
+    )),
+    allowReservedNetworks: Object.freeze(allowReservedNetworks),
     discoverDevServers: value.discoverDevServers === true,
   });
 };

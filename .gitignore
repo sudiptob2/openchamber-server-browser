@@ -7,3 +7,7 @@ config.json
 .DS_Store
 
 .omo/
+
+# Local debug artifacts and npm lockfile (project uses bun.lock)
+.openchamber/
+package-lock.json

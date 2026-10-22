@@ -63,9 +63,24 @@ For several machines or many ports, list a private IPv4 block in `allowedNetwork
 
 A block matches the address a name resolves to, so it also allows any domain that resolves into it on a listed port, including one a web page rebinds there. Keep blocks and port lists narrow, and list loopback servers in `allowedOrigins` rather than as a loopback block.
 
+### Reserved ranges, such as an overlay network
+
+Reserved ranges are blocked outright, and no `allowedOrigins` or `allowedNetworks` entry reaches them. Overlay networks put peers in one: Tailscale uses CGNAT `100.64.0.0/10` and `fd7a:115c:a1e0::/48`. To reach a host there, list its range in `allowReservedNetworks`:
+
+```json
+{
+  "allowReservedNetworks": ["100.64.0.0/10"],
+  "allowedOrigins": ["https://myapp.example"]
+}
+```
+
+Listing a range only makes it grantable, exactly like a private address. Each destination still needs its own `allowedOrigins` entry, or an `allowedNetworks` block, which may then cover a block inside the listed range. A name in `/etc/hosts` is matched as written, so list the name the page uses, not the address it resolves to.
+
+Link-local `169.254.0.0/16` and `fe80::/10`, the unspecified block `0.0.0.0/8`, multicast, and IPv4-mapped IPv6 are refused even when listed, because they defeat the cloud-metadata and loopback protections. `metadata.google.internal` stays blocked by name.
+
 To reach development servers without listing them, set `"discoverDevServers": true`. The service then allows loopback ports with a live listener, over IPv4 and IPv6, and checks again at most every three seconds, so a server that stops loses access. `localhost` uses whichever loopback family the server listens on. Discovery grants only `127.0.0.1`, `[::1]`, and `localhost`, so another name that resolves to loopback stays blocked. Discovery never allows ports held by OpenChamber itself, the host's other child processes such as OpenCode and other extension services, or this extension and its Chrome, and it allows nothing when it cannot tell which process owns a port. SSH, DNS, SMB, printing, common database ports, and the Node.js inspector port are always skipped. Every other loopback listener on the machine can become reachable from pages in the shared browser, including databases on other ports, a second OpenChamber or OpenCode, and debugging ports of other browsers. Keep discovery off where that matters.
 
-Restart the extension after editing its configuration. `localhost` means the machine running the extension, so an SSH-forwarded port must be reachable there. A page that uses another private origin for assets, API requests, or sockets needs that origin allowed too. Origin grants distinguish HTTP from HTTPS and include the corresponding WebSocket traffic on the same host and port. They match the host name in the address, not what it resolves to, so a page on a domain that resolves or rebinds to a granted address cannot reach it, and an alias such as `myapp.test` needs its own entry. `localhost` also uses the grants for `127.0.0.1` and `[::1]`, because the service resolves it itself. Link-local, cloud metadata, CGNAT, IPv6 transition, and reserved ranges remain blocked even when listed.
+Restart the extension after editing its configuration. `localhost` means the machine running the extension, so an SSH-forwarded port must be reachable there. A page that uses another private origin for assets, API requests, or sockets needs that origin allowed too. Origin grants distinguish HTTP from HTTPS and include the corresponding WebSocket traffic on the same host and port. They match the host name in the address, not what it resolves to, so a page on a domain that resolves or rebinds to a granted address cannot reach it, and an alias such as `myapp.test` needs its own entry. `localhost` also uses the grants for `127.0.0.1` and `[::1]`, because the service resolves it itself. CGNAT, IPv6 transition, and other reserved ranges are blocked unless listed in `allowReservedNetworks`; link-local, cloud metadata, the unspecified block, and multicast remain blocked even when listed.
 
 A blocked plain-HTTP address opens a Server Browser page that names the origin, the path of this `config.json`, and the entry to add. For a loopback address it also says whether discovery is off or found no eligible server on that port. HTTPS navigations to a blocked address still end in Chrome's own `ERR_TUNNEL_CONNECTION_FAILED` error.
 

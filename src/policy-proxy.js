@@ -23,22 +23,71 @@ for (const [network, prefix] of [
 ]) PRIVATE_V4.addSubnet(network, prefix, 'ipv4');
 PRIVATE_V6.addAddress('::1', 'ipv6');
 
+// Ranges configuration may never reopen, whatever an operator lists. Cloud
+// metadata answers on link-local, the unspecified block reaches loopback
+// through 0.0.0.0, and multicast fans a request out to unknown listeners.
+const NEVER_OVERRIDABLE_V4 = new net.BlockList();
+const NEVER_OVERRIDABLE_V6 = new net.BlockList();
+
+for (const [network, prefix] of [
+  ['0.0.0.0', 8], ['169.254.0.0', 16], ['224.0.0.0', 4],
+]) NEVER_OVERRIDABLE_V4.addSubnet(network, prefix, 'ipv4');
+
+for (const [network, prefix] of [
+  ['::', 128], ['fe80::', 10], ['ff00::', 8], ['::ffff:0:0', 96],
+]) NEVER_OVERRIDABLE_V6.addSubnet(network, prefix, 'ipv6');
+
 const normalizeHost = (host) => String(host || '').replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase();
 const familyOf = (address) => net.isIP(address) === 6 ? 'ipv6' : 'ipv4';
-export const isPrivateAddress = (address) => (familyOf(address) === 'ipv6'
-  ? PRIVATE_V6.check(address, 'ipv6')
-  : PRIVATE_V4.check(address, 'ipv4'));
+const isMappedIPv4 = (address) => familyOf(address) === 'ipv6' && address.toLowerCase().startsWith('::ffff:');
 
-const permanentlyDenied = (address) => {
+// A reserved range may be moved out of the permanent deny list by configuration,
+// because overlay networks such as Tailscale address their peers inside one.
+// IPv4-mapped IPv6 stays denied: it would let one family's policy stand in for
+// the other's. An override only makes a range grantable, so a destination in it
+// still needs an allowedOrigins or allowedNetworks grant.
+export const canOverrideReserved = (address) => {
+  if (!net.isIP(address) || isMappedIPv4(address)) return false;
+  const family = familyOf(address);
+  const [denied, never] = family === 'ipv6'
+    ? [ALWAYS_DENIED_V6, NEVER_OVERRIDABLE_V6]
+    : [ALWAYS_DENIED_V4, NEVER_OVERRIDABLE_V4];
+  return denied.check(address, family) && !never.check(address, family);
+};
+
+export const createReservedOverrides = (networks = []) => {
+  const blocks = new Map();
+  for (const { address, prefix, family } of networks) {
+    const block = blocks.get(family) ?? blocks.set(family, new net.BlockList()).get(family);
+    block.addSubnet(address, prefix, family);
+  }
+  if (blocks.size === 0) return null;
+  return Object.freeze({
+    check: (address, family = familyOf(address)) => Boolean(blocks.get(family)?.check(address, family)),
+  });
+};
+
+export const isPrivateAddress = (address, overrides = null) => {
+  const family = familyOf(address);
+  if (overrides?.check(address, family)) return true;
+  return family === 'ipv6'
+    ? PRIVATE_V6.check(address, 'ipv6')
+    : PRIVATE_V4.check(address, 'ipv4');
+};
+
+const permanentlyDenied = (address, overrides = null) => {
   const family = familyOf(address);
   if (!net.isIP(address)) return 'DNS returned an invalid address';
   const denied = family === 'ipv6'
     ? ALWAYS_DENIED_V6.check(address, family)
     : ALWAYS_DENIED_V4.check(address, family);
   if (!denied) return null;
-  if (family === 'ipv6' && address.toLowerCase().startsWith('::ffff:')) {
+  if (isMappedIPv4(address)) {
     return 'IPv4-mapped addresses are denied';
   }
+  // A listed range leaves the permanent tier and is treated as private below,
+  // unless the address is one no override may reopen.
+  if (overrides?.check(address, family) && canOverrideReserved(address)) return null;
   if (family === 'ipv4' && address.startsWith('169.254.')) return 'IPv4 link-local addresses are denied';
   return 'Unspecified, link-local, transition, multicast, CGNAT, or reserved addresses are denied';
 };
@@ -61,7 +110,12 @@ const hasGrant = (grants, hostname, address, port, protocol) => grants.some((gra
     && (host === hostname || (hostname === 'localhost' && host === address && LOOPBACK_ADDRESSES.includes(address)));
 });
 
-export const classifyProxyTarget = async (target, { grants = [], devServerGrants = null, lookup = dns.promises.lookup } = {}) => {
+export const classifyProxyTarget = async (target, {
+  grants = [],
+  devServerGrants = null,
+  reservedOverrides = null,
+  lookup = dns.promises.lookup,
+} = {}) => {
   let url;
   try {
     url = target instanceof URL ? new URL(target) : new URL(String(target));
@@ -109,9 +163,9 @@ export const classifyProxyTarget = async (target, { grants = [], devServerGrants
   }
   for (const answer of answers) {
     const address = normalizeHost(answer?.address);
-    const reason = permanentlyDenied(address);
+    const reason = permanentlyDenied(address, reservedOverrides);
     if (reason) return { allowed: false, reason };
-    if (isPrivateAddress(address) && !hasGrant(await grantsFor(), hostname, address, port, url.protocol)) {
+    if (isPrivateAddress(address, reservedOverrides) && !hasGrant(await grantsFor(), hostname, address, port, url.protocol)) {
       return { allowed: false, reason: 'Private or loopback address requires an allowed origin', grantable: true };
     }
   }
@@ -159,6 +213,7 @@ const deniedPage = (reason, { origin = null, grantable = false, configPath = nul
 <p>To allow it, add the origin to <code>allowedOrigins</code> in ${configFile} and restart the extension:</p>
 <pre>${escapeHtml(`{\n  "allowedOrigins": [${JSON.stringify(origin)}]\n}`)}</pre>
 <p>For several machines or ports, add a private CIDR block and its ports to <code>allowedNetworks</code> instead.</p>
+<p>An address in a reserved range, such as an overlay network like Tailscale on <code>100.64.0.0/10</code>, also needs its range in <code>allowReservedNetworks</code>.</p>
 ${discovery}
 <p class="note"><code>localhost</code> and private addresses resolve on the machine running OpenChamber, not on your device.</p>`,
   ] : [

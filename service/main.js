@@ -5901,17 +5901,53 @@ for (const [network, prefix] of [
   ["192.168.0.0", 16]
 ]) PRIVATE_V4.addSubnet(network, prefix, "ipv4");
 PRIVATE_V6.addAddress("::1", "ipv6");
+var NEVER_OVERRIDABLE_V4 = new net.BlockList();
+var NEVER_OVERRIDABLE_V6 = new net.BlockList();
+for (const [network, prefix] of [
+  ["0.0.0.0", 8],
+  ["169.254.0.0", 16],
+  ["224.0.0.0", 4]
+]) NEVER_OVERRIDABLE_V4.addSubnet(network, prefix, "ipv4");
+for (const [network, prefix] of [
+  ["::", 128],
+  ["fe80::", 10],
+  ["ff00::", 8],
+  ["::ffff:0:0", 96]
+]) NEVER_OVERRIDABLE_V6.addSubnet(network, prefix, "ipv6");
 var normalizeHost = (host) => String(host || "").replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
 var familyOf = (address) => net.isIP(address) === 6 ? "ipv6" : "ipv4";
-var isPrivateAddress = (address) => familyOf(address) === "ipv6" ? PRIVATE_V6.check(address, "ipv6") : PRIVATE_V4.check(address, "ipv4");
-var permanentlyDenied = (address) => {
+var isMappedIPv4 = (address) => familyOf(address) === "ipv6" && address.toLowerCase().startsWith("::ffff:");
+var canOverrideReserved = (address) => {
+  if (!net.isIP(address) || isMappedIPv4(address)) return false;
+  const family = familyOf(address);
+  const [denied, never] = family === "ipv6" ? [ALWAYS_DENIED_V6, NEVER_OVERRIDABLE_V6] : [ALWAYS_DENIED_V4, NEVER_OVERRIDABLE_V4];
+  return denied.check(address, family) && !never.check(address, family);
+};
+var createReservedOverrides = (networks = []) => {
+  const blocks = /* @__PURE__ */ new Map();
+  for (const { address, prefix, family } of networks) {
+    const block = blocks.get(family) ?? blocks.set(family, new net.BlockList()).get(family);
+    block.addSubnet(address, prefix, family);
+  }
+  if (blocks.size === 0) return null;
+  return Object.freeze({
+    check: (address, family = familyOf(address)) => Boolean(blocks.get(family)?.check(address, family))
+  });
+};
+var isPrivateAddress = (address, overrides = null) => {
+  const family = familyOf(address);
+  if (overrides?.check(address, family)) return true;
+  return family === "ipv6" ? PRIVATE_V6.check(address, "ipv6") : PRIVATE_V4.check(address, "ipv4");
+};
+var permanentlyDenied = (address, overrides = null) => {
   const family = familyOf(address);
   if (!net.isIP(address)) return "DNS returned an invalid address";
   const denied = family === "ipv6" ? ALWAYS_DENIED_V6.check(address, family) : ALWAYS_DENIED_V4.check(address, family);
   if (!denied) return null;
-  if (family === "ipv6" && address.toLowerCase().startsWith("::ffff:")) {
+  if (isMappedIPv4(address)) {
     return "IPv4-mapped addresses are denied";
   }
+  if (overrides?.check(address, family) && canOverrideReserved(address)) return null;
   if (family === "ipv4" && address.startsWith("169.254.")) return "IPv4 link-local addresses are denied";
   return "Unspecified, link-local, transition, multicast, CGNAT, or reserved addresses are denied";
 };
@@ -5924,7 +5960,12 @@ var hasGrant = (grants, hostname, address, port, protocol) => grants.some((grant
   const host = normalizeHost(grant.host);
   return grant.port === port && (!grant.protocol || grant.protocol === grantProtocol(protocol)) && (host === hostname || hostname === "localhost" && host === address && LOOPBACK_ADDRESSES.includes(address));
 });
-var classifyProxyTarget = async (target, { grants = [], devServerGrants: devServerGrants2 = null, lookup = dns.promises.lookup } = {}) => {
+var classifyProxyTarget = async (target, {
+  grants = [],
+  devServerGrants: devServerGrants2 = null,
+  reservedOverrides = null,
+  lookup = dns.promises.lookup
+} = {}) => {
   let url;
   try {
     url = target instanceof URL ? new URL(target) : new URL(String(target));
@@ -5967,9 +6008,9 @@ var classifyProxyTarget = async (target, { grants = [], devServerGrants: devServ
   }
   for (const answer of answers) {
     const address = normalizeHost(answer?.address);
-    const reason = permanentlyDenied(address);
+    const reason = permanentlyDenied(address, reservedOverrides);
     if (reason) return { allowed: false, reason };
-    if (isPrivateAddress(address) && !hasGrant(await grantsFor(), hostname, address, port, url.protocol)) {
+    if (isPrivateAddress(address, reservedOverrides) && !hasGrant(await grantsFor(), hostname, address, port, url.protocol)) {
       return { allowed: false, reason: "Private or loopback address requires an allowed origin", grantable: true };
     }
   }
@@ -6011,6 +6052,7 @@ var deniedPage = (reason, { origin = null, grantable = false, configPath = null,
   "allowedOrigins": [${JSON.stringify(origin)}]
 }`)}</pre>
 <p>For several machines or ports, add a private CIDR block and its ports to <code>allowedNetworks</code> instead.</p>
+<p>An address in a reserved range, such as an overlay network like Tailscale on <code>100.64.0.0/10</code>, also needs its range in <code>allowReservedNetworks</code>.</p>
 ${discovery}
 <p class="note"><code>localhost</code> and private addresses resolve on the machine running OpenChamber, not on your device.</p>`
   ] : [
@@ -6242,15 +6284,31 @@ var parsePorts = (value, label) => {
     return Object.freeze([first, last]);
   }));
 };
-var parseAllowedNetwork = (value, index) => {
+var parseReservedNetwork = (value, index) => {
+  const label = `config.allowReservedNetworks[${index}]`;
+  const cidr = typeof value === "string" ? /^(.+)\/(\d+)$/.exec(value.trim()) : null;
+  const prefix = Number(cidr?.[2]);
+  const address = cidr?.[1] ?? "";
+  const family = net2.isIPv6(address) ? "ipv6" : net2.isIPv4(address) ? "ipv4" : null;
+  const narrowest = family === "ipv6" ? 128 : 32;
+  const broadest = family === "ipv6" ? 16 : 8;
+  if (!cidr || !family || prefix < broadest || prefix > narrowest) {
+    throw new Error(`${label} must be a CIDR block from /${broadest} to /${narrowest}, such as 100.64.0.0/10`);
+  }
+  if (!canOverrideReserved(address)) {
+    throw new Error(`${label} must name a reserved range that is blocked by default; ${address} is not one, so it needs no override`);
+  }
+  return Object.freeze({ cidr: `${address}/${prefix}`, address, prefix, family });
+};
+var parseAllowedNetwork = (value, index, reservedOverrides) => {
   const label = `config.allowedNetworks[${index}]`;
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`${label} must be an object with cidr and ports`);
   }
   const cidr = typeof value.cidr === "string" ? /^([\d.]+)\/(\d+)$/.exec(value.cidr) : null;
   const prefix = Number(cidr?.[2]);
-  if (!cidr || !net2.isIPv4(cidr[1]) || prefix < 8 || prefix > 32 || !isPrivateAddress(cidr[1])) {
-    throw new Error(`${label}.cidr must be a private or loopback IPv4 block from /8 to /32, such as 192.168.1.0/24`);
+  if (!cidr || !net2.isIPv4(cidr[1]) || prefix < 8 || prefix > 32 || !isPrivateAddress(cidr[1], reservedOverrides)) {
+    throw new Error(`${label}.cidr must be a private, loopback, or allowReservedNetworks IPv4 block from /8 to /32, such as 192.168.1.0/24`);
   }
   return Object.freeze({ cidr: value.cidr, address: cidr[1], prefix, ports: parsePorts(value.ports, label) });
 };
@@ -6269,14 +6327,22 @@ var parseConfig = (value) => {
   if (value.allowedNetworks !== void 0 && !Array.isArray(value.allowedNetworks)) {
     throw new Error("config.allowedNetworks must be an array");
   }
+  if (value.allowReservedNetworks !== void 0 && !Array.isArray(value.allowReservedNetworks)) {
+    throw new Error("config.allowReservedNetworks must be an array");
+  }
   if (value.discoverDevServers !== void 0 && typeof value.discoverDevServers !== "boolean") {
     throw new Error("config.discoverDevServers must be true or false");
   }
   const allowedOrigins = (value.allowedOrigins ?? []).map(parseAllowedOrigin);
+  const allowReservedNetworks = (value.allowReservedNetworks ?? []).map(parseReservedNetwork);
+  const reservedOverrides = createReservedOverrides(allowReservedNetworks);
   return Object.freeze({
     chromePath: chromePath?.trim() ?? null,
     allowedOrigins: Object.freeze([...new Set(allowedOrigins)]),
-    allowedNetworks: Object.freeze((value.allowedNetworks ?? []).map(parseAllowedNetwork)),
+    allowedNetworks: Object.freeze((value.allowedNetworks ?? []).map(
+      (network, index) => parseAllowedNetwork(network, index, reservedOverrides)
+    )),
+    allowReservedNetworks: Object.freeze(allowReservedNetworks),
     discoverDevServers: value.discoverDevServers === true
   });
 };
@@ -6724,12 +6790,14 @@ var createBrowserRuntime = ({
   chromePath = null,
   allowedOrigins = [],
   allowedNetworks = [],
+  allowReservedNetworks = [],
   configPath = null,
   devServers = null
 } = {}) => {
   const chrome = createChromeProcess({ chromePath });
   const proxy = createPolicyProxy({
     grants: [...originGrants(allowedOrigins), ...networkGrants(allowedNetworks)],
+    reservedOverrides: createReservedOverrides(allowReservedNetworks),
     configPath,
     devServerGrants: devServers ? () => devServers.grants() : null
   });

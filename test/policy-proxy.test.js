@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import http from 'node:http';
 import net from 'node:net';
 import test from 'node:test';
-import { classifyProxyTarget, createPolicyProxy } from '../src/policy-proxy.js';
+import { classifyProxyTarget, createPolicyProxy, createReservedOverrides } from '../src/policy-proxy.js';
 
 const listen = (server) => new Promise((resolve, reject) => {
   server.once('error', reject);
@@ -52,6 +52,106 @@ test('allows a private network block only on its listed ports', async () => {
 
   assert.equal(allowed.allowed, true);
   assert.deepEqual([otherPort.allowed, otherNetwork.allowed, loopback.allowed], [false, false, false]);
+});
+
+test('makes an overridden reserved range grantable without allowing it outright', async () => {
+  // Given an overlay network, such as Tailscale, addressing its peers in CGNAT space.
+  const reservedOverrides = createReservedOverrides([{ address: '100.64.0.0', prefix: 10, family: 'ipv4' }]);
+  const lookup = async () => [{ address: '100.70.46.55', family: 4 }];
+
+  // When the name has a grant, then it resolves like any other private target.
+  const granted = await classifyProxyTarget('https://peer.test/', {
+    lookup,
+    reservedOverrides,
+    grants: [{ host: 'peer.test', port: 443, protocol: 'https:' }],
+  });
+  assert.deepEqual([granted.allowed, granted.address], [true, '100.70.46.55']);
+
+  // When it has none, then the override alone does not open it.
+  const ungranted = await classifyProxyTarget('https://peer.test/', { lookup, reservedOverrides });
+  assert.deepEqual(
+    [ungranted.allowed, ungranted.reason, ungranted.grantable],
+    [false, 'Private or loopback address requires an allowed origin', true],
+  );
+
+  // When nothing is overridden, then the range stays permanently denied.
+  const withoutOverride = await classifyProxyTarget('https://peer.test/', {
+    lookup,
+    grants: [{ host: 'peer.test', port: 443, protocol: 'https:' }],
+  });
+  assert.equal(withoutOverride.allowed, false);
+  assert.equal(withoutOverride.grantable, undefined);
+});
+
+test('keeps other reserved ranges denied when one is overridden', async () => {
+  const reservedOverrides = createReservedOverrides([{ address: '100.64.0.0', prefix: 10, family: 'ipv4' }]);
+  const grants = [{ host: 'peer.test', port: 80, protocol: 'http:' }];
+
+  for (const [address, expected] of [
+    ['169.254.169.254', 'IPv4 link-local addresses are denied'],
+    ['224.0.0.1', 'Unspecified, link-local, transition, multicast, CGNAT, or reserved addresses are denied'],
+    ['::ffff:100.70.46.55', 'IPv4-mapped addresses are denied'],
+  ]) {
+    const decision = await classifyProxyTarget('http://peer.test/', {
+      grants,
+      reservedOverrides,
+      lookup: async () => [{ address, family: net.isIP(address) }],
+    });
+    assert.deepEqual([decision.allowed, decision.reason], [false, expected], address);
+  }
+
+  // Cloud metadata stays denied by name even inside an overridden range.
+  const metadata = await classifyProxyTarget('http://metadata.google.internal/', { grants, reservedOverrides });
+  assert.equal(metadata.reason, 'Cloud metadata host is denied');
+});
+
+test('clears a dual-stack answer whose IPv6 record is in an overridden range', async () => {
+  // Given a tailnet name answering with both families, IPv6 first, since one
+  // denied answer fails the whole request however the other family is listed.
+  const reservedOverrides = createReservedOverrides([
+    { address: '100.64.0.0', prefix: 10, family: 'ipv4' },
+    { address: 'fd7a:115c:a1e0::', prefix: 48, family: 'ipv6' },
+  ]);
+  const lookup = async () => [
+    { address: 'fd7a:115c:a1e0::3b35:4741', family: 6 },
+    { address: '100.70.46.55', family: 4 },
+  ];
+
+  const decision = await classifyProxyTarget('https://peer.test/docs', {
+    lookup,
+    reservedOverrides,
+    grants: [{ host: 'peer.test', port: 443, protocol: 'https:' }],
+  });
+  assert.deepEqual([decision.allowed, decision.address], [true, 'fd7a:115c:a1e0::3b35:4741']);
+
+  // When only IPv4 is listed, then the IPv6 answer still blocks the request.
+  const v4Only = await classifyProxyTarget('https://peer.test/docs', {
+    lookup,
+    reservedOverrides: createReservedOverrides([{ address: '100.64.0.0', prefix: 10, family: 'ipv4' }]),
+    grants: [{ host: 'peer.test', port: 443, protocol: 'https:' }],
+  });
+  assert.equal(v4Only.allowed, false);
+});
+
+test('refuses to reopen metadata, unspecified, and multicast ranges however they are listed', async () => {
+  // Given an operator who lists over-broad blocks covering protected ranges.
+  const reservedOverrides = createReservedOverrides([
+    { address: '0.0.0.0', prefix: 8, family: 'ipv4' },
+    { address: '169.254.0.0', prefix: 16, family: 'ipv4' },
+    { address: '224.0.0.0', prefix: 4, family: 'ipv4' },
+    { address: 'fe80::', prefix: 10, family: 'ipv6' },
+  ]);
+  const grants = [{ host: 'evil.test', port: 80, protocol: 'http:' }];
+
+  for (const address of ['169.254.169.254', '0.0.0.0', '224.0.0.1', 'fe80::1']) {
+    const decision = await classifyProxyTarget('http://evil.test/', {
+      grants,
+      reservedOverrides,
+      lookup: async () => [{ address, family: net.isIP(address) }],
+    });
+    assert.equal(decision.allowed, false, address);
+    assert.equal(decision.grantable, undefined, address);
+  }
 });
 
 test('denies a hostname when any DNS answer is unsafe', async () => {
